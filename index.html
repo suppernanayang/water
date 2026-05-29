@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<!-- saved from url=(0113)https://ep-redim-i1.xhscdn.com/redcity_open/20260529/5175a61c996d48b99403af84e5be4068.html?id=7645263335427008721 -->
+<html lang="zh"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+
+<title>水波</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; display:flex; justify-content:center; align-items:center; height:100vh; overflow:hidden; }
+#wrap { position:relative; display:inline-block; }
+canvas { display:block; }
+#fx { position:absolute; top:0; left:0; pointer-events:none; }
+#tip {
+  position:fixed; bottom:14px; left:50%; transform:translateX(-50%);
+  color:rgba(255,255,255,0.45); font:13px sans-serif;
+  background:rgba(0,0,0,0.3); padding:5px 16px; border-radius:20px;
+  pointer-events:none; white-space:nowrap;
+}
+#btn {
+  position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+  padding:14px 32px; font-size:17px; background:rgba(10,10,20,0.92);
+  color:#fff; border:1px solid rgba(200,200,255,0.3); border-radius:12px;
+  cursor:pointer; letter-spacing:2px; z-index:10;
+}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="bg"></canvas>
+  <canvas id="fx"></canvas>
+</div>
+<div id="tip">把手放到摄像头前</div>
+<button id="btn">📷 开启摄像头</button>
+<video id="vid" playsinline="" autoplay="" muted="" style="display:none"></video>
+
+<script src="./水波交互_files/camera_utils.js" crossorigin="anonymous"></script>
+<script src="./水波交互_files/hands.js" crossorigin="anonymous"></script>
+<script>
+const vid = document.getElementById('vid');
+const bg  = document.getElementById('bg');
+const fx  = document.getElementById('fx');
+const bgCtx = bg.getContext('2d');
+const fxCtx = fx.getContext('2d');
+const tip = document.getElementById('tip');
+
+let W = 0, H = 0;
+
+// ── 水面高度场（低分辨率，提升性能）────────────────────────
+const SCALE = 3; // 每SCALE像素一个格子
+let GW = 0, GH = 0;
+let cur, prev, next_buf;
+
+function initWater(w, h) {
+  GW = Math.ceil(w / SCALE);
+  GH = Math.ceil(h / SCALE);
+  cur  = new Float32Array(GW * GH);
+  prev = new Float32Array(GW * GH);
+  next_buf = new Float32Array(GW * GH);
+}
+
+// ── 物理模拟：波动方程 ───────────────────────────────────────
+function stepWater() {
+  const damping = 0.982;
+  for (let y = 1; y < GH - 1; y++) {
+    for (let x = 1; x < GW - 1; x++) {
+      const i = y * GW + x;
+      const lap = cur[i-1] + cur[i+1] + cur[(y-1)*GW+x] + cur[(y+1)*GW+x] - 4 * cur[i];
+      next_buf[i] = (2 * cur[i] - prev[i] + 0.4 * lap) * damping;
+    }
+  }
+  // 轮换缓冲
+  const tmp = prev;
+  prev = cur;
+  cur = next_buf;
+  next_buf = tmp;
+}
+
+// ── 手指约束：沿移动方向拉伸的渗入圆，只跟随食指尖────
+// 记录每根食指的移动向量（支持双手）
+let prevFingers = {};
+
+function pressWater(fingers) {
+  if (fingers.length === 0) {
+    prevFingers = {};
+    return;
+  }
+
+  fingers.forEach((f, idx) => {
+    const gx = f.x / SCALE;
+    const gy = f.y / SCALE;
+
+    // 计算移动向量
+    let vx = 0, vy = 0;
+    if (prevFingers[idx]) {
+      vx = gx - prevFingers[idx].x;
+      vy = gy - prevFingers[idx].y;
+    }
+    prevFingers[idx] = { x: gx, y: gy };
+
+    const speed = Math.sqrt(vx*vx + vy*vy);
+
+    // 渗入圆：沿移动方向拉伸
+    const rBase = 22 / SCALE;
+    const rAlong = rBase + Math.min(speed * 2.5, 16 / SCALE);
+
+    // 移动方向单位向量
+    const len = speed > 0.01 ? speed : 1;
+    const ax = vx / len, ay = vy / len;
+    const bx = -ay, by = ax;
+
+    const igx = Math.round(gx), igy = Math.round(gy);
+    const scanR = Math.ceil(Math.max(rBase, rAlong)) + 1;
+
+    for (let dy = -scanR; dy <= scanR; dy++) {
+      for (let dx = -scanR; dx <= scanR; dx++) {
+        const nx = igx + dx, ny2 = igy + dy;
+        if (nx < 0 || nx >= GW || ny2 < 0 || ny2 >= GH) continue;
+
+        const projAlong = dx * ax + dy * ay;
+        const projPerp  = dx * bx + dy * by;
+
+        const ellDist = Math.sqrt(
+          (projAlong / rAlong) * (projAlong / rAlong) +
+          (projPerp  / rBase)  * (projPerp  / rBase)
+        );
+        if (ellDist > 1.0) continue;
+
+        const strength = (1 - ellDist) * (1 - ellDist);
+        const target = -0.72 * strength;
+        const i2 = ny2 * GW + nx;
+
+        cur[i2]  = cur[i2]  + (target - cur[i2])  * 0.6;
+        prev[i2] = prev[i2] + (target - prev[i2]) * 0.6;
+      }
+    }
+  });
+}
+
+// ── 渲染：折射 ───────────────────────────────────────────────
+let bgImgData = null;
+let outImgData = null;
+
+function renderWater() {
+  // 每帧读取背景像素
+  try {
+    bgImgData = bgCtx.getImageData(0, 0, W, H);
+  } catch(e) { return; }
+
+  if (!outImgData || outImgData.width !== W) {
+    outImgData = fxCtx.createImageData(W, H);
+  }
+
+  const src = bgImgData.data;
+  const dst = outImgData.data;
+
+  // 折射强度
+  const refStr = 6.0;
+
+  for (let py = 0; py < H; py++) {
+    for (let px = 0; px < W; px++) {
+      const gx = Math.min(Math.floor(px / SCALE), GW - 2);
+      const gy = Math.min(Math.floor(py / SCALE), GH - 2);
+      const i = gy * GW + gx;
+
+      // 水面梯度（法线）
+      const dhdx = (cur[i+1] - cur[i-1 < 0 ? i : i-1]);
+      const dhdy = (cur[i+GW < GW*GH ? i+GW : i] - cur[i-GW >= 0 ? i-GW : i]);
+
+      // 折射偏移
+      const ox = Math.round(dhdx * refStr);
+      const oy = Math.round(dhdy * refStr);
+
+      const sx = Math.max(0, Math.min(W-1, px + ox));
+      const sy = Math.max(0, Math.min(H-1, py + oy));
+
+      const si = (sy * W + sx) * 4;
+      const di = (py * W + px) * 4;
+
+      dst[di]   = src[si];
+      dst[di+1] = src[si+1];
+      dst[di+2] = src[si+2];
+
+      // 波边缘极淡高光（透明感）
+      const grad = Math.abs(dhdx) + Math.abs(dhdy);
+      const light = Math.min(255, Math.round(grad * 420));
+      dst[di]   = Math.min(255, dst[di]   + light);
+      dst[di+1] = Math.min(255, dst[di+1] + light);
+      dst[di+2] = Math.min(255, dst[di+2] + light);
+      dst[di+3] = 255;
+    }
+  }
+
+  fxCtx.putImageData(outImgData, 0, 0);
+}
+
+// ── 手指坐标（像素） ─────────────────────────────────────────
+let fingers = [];
+
+// ── 主循环 ───────────────────────────────────────────────────
+function loop() {
+  if (!W) { requestAnimationFrame(loop); return; }
+
+  // 画背景（摄像头，镜像）
+  if (vid.readyState >= 2) {
+    bgCtx.save();
+    bgCtx.translate(W, 0);
+    bgCtx.scale(-1, 1);
+    bgCtx.drawImage(vid, 0, 0, W, H);
+    bgCtx.restore();
+  }
+
+  pressWater(fingers);
+  stepWater();
+  renderWater();
+
+  requestAnimationFrame(loop);
+}
+
+// ── MediaPipe ────────────────────────────────────────────────
+function onResults(results) {
+  fingers = [];
+  if (results.multiHandLandmarks?.length > 0) {
+    results.multiHandLandmarks.forEach(hand => {
+      // 只取食指指尖（关键点8）
+      const lm = hand[8];
+      fingers.push({
+        x: (1 - lm.x) * W,  // 镜像X
+        y: lm.y * H
+      });
+    });
+    tip.textContent = '✋ 移动手指感受水波';
+  } else {
+    tip.textContent = '👋 把手放到摄像头前';
+  }
+}
+
+// ── 启动 ─────────────────────────────────────────────────────
+document.getElementById('btn').addEventListener('click', async () => {
+  document.getElementById('btn').style.display = 'none';
+  tip.textContent = '加载中…';
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width:{ideal:1280}, height:{ideal:720}, facingMode:'user' },
+    audio: false
+  });
+  vid.srcObject = stream;
+  await vid.play();
+
+  vid.addEventListener('loadedmetadata', () => {
+    W = vid.videoWidth; H = vid.videoHeight;
+    bg.width = fx.width = W;
+    bg.height = fx.height = H;
+    const scale = Math.min(window.innerWidth*0.95/W, window.innerHeight*0.95/H, 1);
+    bg.style.width  = fx.style.width  = `${W*scale}px`;
+    bg.style.height = fx.style.height = `${H*scale}px`;
+    initWater(W, H);
+    requestAnimationFrame(loop);
+  });
+
+  const hands = new Hands({
+    locateFile: f => `https://unpkg.com/@mediapipe/hands/${f}`
+  });
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.65
+  });
+  hands.onResults(onResults);
+
+  const camera = new Camera(vid, {
+    onFrame: async () => { await hands.send({ image: vid }); },
+    width: 1280, height: 720
+  });
+  camera.start();
+});
+</script>
+
+
+</body></html>
